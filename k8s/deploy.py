@@ -182,6 +182,7 @@ deploy = {
         "template": {
             "metadata": {"labels": {"app": APP}},
             "spec": {
+                "imagePullSecrets": [{"name": "ghcr-secret"}],
                 "containers": [{
                     "name": APP,
                     "image": IMAGE,
