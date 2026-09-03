@@ -150,14 +150,18 @@ jobs:
             kubectl logs -l app=${APP_NAME} -n ${K8S_NAMESPACE} --tail=20 || true
             exit 1
           fi
-          # Functional smoke: hit Traefik LB directly with Host header (no DNS dependency).
-          ENDPOINT="${INGRESS_ENDPOINT:?required}"
+          # Functional smoke: probe the app Service from inside the cluster via a temp pod.
+          # (Runner is on public internet; the Traefik LB 192.168.36.200 is internal-only.
+          #  Public access via ${DOMAIN} requires a DNS record pointing at the LB's public front.)
           for i in $(seq 1 12); do
-            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 -H "Host: ${DOMAIN}" "https://${ENDPOINT}/api/stats" || true)
+            CODE=$(kubectl run smoke-${GITHUB_RUN_ID}-$i --rm -i --restart=Never \
+              --image=curlimages/curl:latest -n ${K8S_NAMESPACE} -- \
+              -s -o /dev/null -w "%{http_code}" --max-time 10 \
+              "http://${APP_NAME}.${K8S_NAMESPACE}.svc.cluster.local:3001/api/stats" 2>/dev/null || true)
             if [ "$CODE" = "200" ]; then
-              echo "SMOKE TEST PASSED (HTTPS 200 /api/stats via ${ENDPOINT}, Host: ${DOMAIN})"
+              echo "SMOKE TEST PASSED (in-cluster HTTP 200 /api/stats on ${APP_NAME}:3001)"
               exit 0
             fi
-            echo "attempt $i: HTTPS code=$CODE"; sleep 10
+            echo "attempt $i: code=$CODE"; sleep 10
           done
           echo "SMOKE TEST FAILED"; exit 1
