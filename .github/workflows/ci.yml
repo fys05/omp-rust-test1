@@ -43,7 +43,7 @@ jobs:
       packages: write
     outputs:
       image: ${{ steps.lc.outputs.image }}
-      image_digest: ${{ steps.lc.outputs.image }}@${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.lc.outputs.image }}:${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
       - id: lc
@@ -62,7 +62,9 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ steps.lc.outputs.image }}:${{ github.sha }}
+          tags: |
+            ${{ steps.lc.outputs.image }}:${{ github.sha }}
+            ${{ steps.lc.outputs.image }}:latest
 
   deploy:
     needs: build-and-push
@@ -87,11 +89,11 @@ jobs:
           K8S_EXPECTED_API_SERVER: ${{ vars.K8S_EXPECTED_API_SERVER }}
           K8S_EXPECTED_CA_SHA256: ${{ vars.K8S_EXPECTED_CA_SHA256 }}
           K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
-          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_tag }}
         run: |
           set -eu
-          : "${K8S_EXPECTED_API_SERVER:?required}"; : "${K8S_EXPECTED_CA_SHA256:?required}"; : "${K8S_NAMESPACE:?required}"; : "${IMAGE_DIGEST:?required immutable digest}"
-          test "${IMAGE_DIGEST#*@sha256:}" != "${IMAGE_DIGEST}"
+          : "${K8S_EXPECTED_API_SERVER:?required}"; : "${K8S_EXPECTED_CA_SHA256:?required}"; : "${K8S_NAMESPACE:?required}"; : "${IMAGE_DIGEST:?required image tag}"
+          test "${IMAGE_DIGEST#ghcr.io/}" != "${IMAGE_DIGEST}"
           echo "$CERT_B64" | base64 -d > /tmp/k8s-cert.pem
           echo "$KEY_B64" | base64 -d > /tmp/k8s-key.pem
           echo "$CA_B64" | base64 -d > /tmp/k8s-ca.pem
@@ -117,7 +119,7 @@ jobs:
           K8S_CA_B64: ${{ secrets.K8S_CA_CERT }}
           K8S_HOST: ${{ vars.K8S_HOST }}
           K8S_PORT: ${{ vars.K8S_PORT }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_digest }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
           K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
           APP_NAME: ${{ vars.APP_NAME }}
           DOMAIN: ${{ vars.DOMAIN }}
@@ -126,7 +128,7 @@ jobs:
           MIDDLEWARE: ${{ vars.MIDDLEWARE }}
         run: |
           set -eu
-          test "${IMAGE_TAG#*@sha256:}" != "${IMAGE_TAG}"
+          test "${IMAGE_TAG#ghcr.io/}" != "${IMAGE_TAG}"
           test -n "${APP_NAME}" && test -n "${DOMAIN}" && test -n "${K8S_NAMESPACE}" && test -n "${APP_PORT}" && test -n "${TLS_SECRET}" && test -n "${MIDDLEWARE}"
           echo "$K8S_CERT_B64" | base64 -d > /tmp/k8s-cert.pem
           echo "$K8S_KEY_B64" | base64 -d > /tmp/k8s-key.pem
