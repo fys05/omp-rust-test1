@@ -98,10 +98,10 @@ jobs:
           openssl x509 -in /tmp/k8s-ca.pem -outform DER -out /tmp/k8s-ca.der
           test "$(sha256sum /tmp/k8s-ca.der | cut -d ' ' -f1)" = "$K8S_EXPECTED_CA_SHA256"
           kubectl config set-cluster k8s --server="https://${K8S_HOST}:${K8S_PORT}" --certificate-authority=/tmp/k8s-ca.pem --tls-server-name=kubernetes
-          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "$K8S_EXPECTED_API_SERVER"
           kubectl config set-credentials admin --client-certificate=/tmp/k8s-cert.pem --client-key=/tmp/k8s-key.pem
           kubectl config set-context production --cluster=k8s --user=admin --namespace="${K8S_NAMESPACE}"
           kubectl config use-context production
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "$K8S_EXPECTED_API_SERVER"
           require_can_i() {
             test "$(kubectl auth can-i "$@")" = "yes"
           }
