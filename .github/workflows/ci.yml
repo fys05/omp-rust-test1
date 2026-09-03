@@ -139,6 +139,7 @@ jobs:
           DOMAIN: ${{ vars.DOMAIN }}
           APP_NAME: ${{ vars.APP_NAME }}
           K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          INGRESS_ENDPOINT: ${{ vars.INGRESS_ENDPOINT }}
         run: |
           set -eu
           # Pod readiness gate (kubeconfig from preflight step context)
@@ -149,11 +150,12 @@ jobs:
             kubectl logs -l app=${APP_NAME} -n ${K8S_NAMESPACE} --tail=20 || true
             exit 1
           fi
-          # Functional smoke: app-specific API through ingress over HTTPS
+          # Functional smoke: hit Traefik LB directly with Host header (no DNS dependency).
+          ENDPOINT="${INGRESS_ENDPOINT:?required}"
           for i in $(seq 1 12); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${DOMAIN}/api/stats" || true)
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 -H "Host: ${DOMAIN}" "https://${ENDPOINT}/api/stats" || true)
             if [ "$CODE" = "200" ]; then
-              echo "SMOKE TEST PASSED (HTTPS 200 /api/stats)"
+              echo "SMOKE TEST PASSED (HTTPS 200 /api/stats via ${ENDPOINT}, Host: ${DOMAIN})"
               exit 0
             fi
             echo "attempt $i: HTTPS code=$CODE"; sleep 10
