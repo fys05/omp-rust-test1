@@ -1,0 +1,159 @@
+name: CI/CD
+on:
+  push:
+    branches: [main]
+
+env:
+  RUST_VERSION: "stable"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings -A clippy::uninlined_format_args -A clippy::bind_instead_of_map -A clippy::map_flatten
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --verbose
+
+  build-and-push:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.lc.outputs.image }}
+      image_digest: ${{ steps.lc.outputs.image }}@${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: lc
+        run: echo "image=$(echo '${{ env.REGISTRY }}/${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - id: build
+        name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.lc.outputs.image }}:${{ github.sha }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    concurrency:
+      group: production-${{ vars.K8S_NAMESPACE }}-${{ vars.APP_NAME }}-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.31.0"
+      - name: Preflight and build kubeconfig
+        env:
+          CERT_B64: ${{ secrets.K8S_CLIENT_CERT }}
+          KEY_B64: ${{ secrets.K8S_CLIENT_KEY }}
+          CA_B64: ${{ secrets.K8S_CA_CERT }}
+          K8S_HOST: ${{ vars.K8S_HOST }}
+          K8S_PORT: ${{ vars.K8S_PORT }}
+          K8S_EXPECTED_API_SERVER: ${{ vars.K8S_EXPECTED_API_SERVER }}
+          K8S_EXPECTED_CA_SHA256: ${{ vars.K8S_EXPECTED_CA_SHA256 }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+        run: |
+          set -eu
+          : "${K8S_EXPECTED_API_SERVER:?required}"; : "${K8S_EXPECTED_CA_SHA256:?required}"; : "${K8S_NAMESPACE:?required}"; : "${IMAGE_DIGEST:?required immutable digest}"
+          test "${IMAGE_DIGEST#*@sha256:}" != "${IMAGE_DIGEST}"
+          echo "$CERT_B64" | base64 -d > /tmp/k8s-cert.pem
+          echo "$KEY_B64" | base64 -d > /tmp/k8s-key.pem
+          echo "$CA_B64" | base64 -d > /tmp/k8s-ca.pem
+          openssl x509 -in /tmp/k8s-ca.pem -outform DER -out /tmp/k8s-ca.der
+          test "$(sha256sum /tmp/k8s-ca.der | cut -d ' ' -f1)" = "$K8S_EXPECTED_CA_SHA256"
+          kubectl config set-cluster k8s --server="https://${K8S_HOST}:${K8S_PORT}" --certificate-authority=/tmp/k8s-ca.pem --tls-server-name=kubernetes
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "$K8S_EXPECTED_API_SERVER"
+          kubectl config set-credentials admin --client-certificate=/tmp/k8s-cert.pem --client-key=/tmp/k8s-key.pem
+          kubectl config set-context production --cluster=k8s --user=admin --namespace="${K8S_NAMESPACE}"
+          kubectl config use-context production
+          require_can_i() {
+            test "$(kubectl auth can-i "$@")" = "yes"
+          }
+          require_can_i get pods -n "${K8S_NAMESPACE}"
+          require_can_i create deployments.apps -n "${K8S_NAMESPACE}"
+          kubectl create configmap preflight-admission-check --from-literal=commit="${{ github.sha }}" -n "${K8S_NAMESPACE}" --dry-run=server -o yaml >/dev/null
+          jq -n --arg api "$K8S_EXPECTED_API_SERVER" --arg ca "$K8S_EXPECTED_CA_SHA256" --arg sha "${{ github.sha }}" --arg ref "${{ github.ref }}" --arg run "$GITHUB_RUN_ID" '{status:"PASS",api_server:$api,ca_sha256:$ca,commit_sha:$sha,ref:$ref,run_id:$run}' > preflight.json
+          jq -e --arg sha "${{ github.sha }}" --arg ref "${{ github.ref }}" --arg api "$K8S_EXPECTED_API_SERVER" --arg ca "$K8S_EXPECTED_CA_SHA256" '.status == "PASS" and .api_server == $api and .ca_sha256 == $ca and .commit_sha == $sha and .ref == $ref and (.run_id|tostring) == (env.GITHUB_RUN_ID|tostring)' preflight.json >/dev/null
+      - name: Deploy app
+        env:
+          K8S_CERT_B64: ${{ secrets.K8S_CLIENT_CERT }}
+          K8S_KEY_B64: ${{ secrets.K8S_CLIENT_KEY }}
+          K8S_CA_B64: ${{ secrets.K8S_CA_CERT }}
+          K8S_HOST: ${{ vars.K8S_HOST }}
+          K8S_PORT: ${{ vars.K8S_PORT }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_digest }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          TLS_SECRET: ${{ vars.TLS_SECRET }}
+          MIDDLEWARE: ${{ vars.MIDDLEWARE }}
+        run: |
+          set -eu
+          test "${IMAGE_TAG#*@sha256:}" != "${IMAGE_TAG}"
+          test -n "${APP_NAME}" && test -n "${DOMAIN}" && test -n "${K8S_NAMESPACE}" && test -n "${APP_PORT}" && test -n "${TLS_SECRET}" && test -n "${MIDDLEWARE}"
+          echo "$K8S_CERT_B64" | base64 -d > /tmp/k8s-cert.pem
+          echo "$K8S_KEY_B64" | base64 -d > /tmp/k8s-key.pem
+          echo "$K8S_CA_B64" | base64 -d > /tmp/k8s-ca.pem
+          python3 k8s/deploy.py
+      - name: Smoke test
+        env:
+          DOMAIN: ${{ vars.DOMAIN }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          set -eu
+          # Pod readiness gate (kubeconfig from preflight step context)
+          kubectl rollout status deployment/${APP_NAME} -n ${K8S_NAMESPACE} --timeout=180s
+          READY=$(kubectl get pods -l app=${APP_NAME} -n ${K8S_NAMESPACE} --no-headers | awk '$2=="1/1"' | wc -l)
+          if [ "$READY" -eq 0 ]; then
+            echo "ERROR: No app pods Ready"
+            kubectl logs -l app=${APP_NAME} -n ${K8S_NAMESPACE} --tail=20 || true
+            exit 1
+          fi
+          # Functional smoke: app-specific API through ingress over HTTPS
+          for i in $(seq 1 12); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${DOMAIN}/api/stats" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "SMOKE TEST PASSED (HTTPS 200 /api/stats)"
+              exit 0
+            fi
+            echo "attempt $i: HTTPS code=$CODE"; sleep 10
+          done
+          echo "SMOKE TEST FAILED"; exit 1
